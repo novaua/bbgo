@@ -21,6 +21,7 @@ Upstream docs: `README.md`, `CLAUDE.md`, `doc/`.
 | `~/.config/systemd/user/bbgo.service` | The unit. Runs with `WorkingDirectory=~/bbgo`. |
 | `~/.local/node` | Node 22.14.0 (user-level; matches `.nvmrc`). |
 | `~/.local/bin/yarn` | yarn 1.22.22, used only for building the dashboard. |
+| `~/.bbgo_profile` | Build env to `source` before rebuilding (§3). Not in git. |
 | `~/go/pkg/mod` | Go module cache (~1.7 GB). |
 | `~/go/tmp` | Go build temp dir. **Mandatory** — see §3. |
 
@@ -71,6 +72,12 @@ check. Re-enable with `loginctl enable-linger vgerman` (no sudo needed).
    mkdir -p $GOTMPDIR
    ```
 
+   Do **not** try to fix this by enlarging the tmpfs. A tmpfs is RAM, not
+   disk: `size=2G` on a 1.7 GB box does not add capacity, it just turns a clean
+   "No space left on device" into swap thrash and OOM kills. Putting `/tmp` on
+   the disk (77 GB free) is the sound long-term fix, but it is *not* done here —
+   hence the env var instead.
+
 2. **`make` is not installed**, so the `Makefile` targets (`make bbgo`,
    `make bbgo-slim`, `make static`) are unavailable. Use the raw commands below;
    they are exactly what those targets run.
@@ -79,21 +86,48 @@ check. Re-enable with `loginctl enable-linger vgerman` (no sudo needed).
    (the default here) silently downloads the newer toolchain on first build and
    caches it. That is expected — the first build after a Go bump needs network.
 
-Also useful: keep parallelism at 2 so the build cannot blow past 2 GB of RAM.
-`export GOMAXPROCS=2 GOFLAGS=-p=2`.
+Also useful: keep parallelism at 2 so the build cannot blow past 2 GB of RAM
+(`GOMAXPROCS=2 GOFLAGS=-p=2`).
+
+### Source `~/.bbgo_profile` instead of typing all that
+
+All of the above lives in one file kept **outside** the repo:
+
+```bash
+source ~/.bbgo_profile      # PATH, GOTMPDIR, TMPDIR, GOMAXPROCS, GOFLAGS
+```
+
+It is deliberately **not** wired into `~/.bashrc`. `TMPDIR` is inherited by every
+program a shell launches, so redirecting it belongs to a build session, not to
+your whole login environment. Sourcing it twice is safe — `PATH` is only
+extended when the entry is missing.
+
+Recreate it with this if it ever goes missing:
+
+```bash
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+export GOTMPDIR="$HOME/go/tmp"
+export TMPDIR="$HOME/go/tmp"
+mkdir -p "$GOTMPDIR"
+export GOMAXPROCS=2
+export GOFLAGS=-p=2
+```
+
+Verify with `go env GOTMPDIR` — it must print `/home/vgerman/go/tmp`.
 
 ### A. Normal update (Go code only, dashboard unchanged)
 
-This is the common case after `git pull`. It reuses the existing generated
-`pkg/server/assets.go`, so it is the fastest path (~4–5 min, mostly linking).
+This is the common case for a code-only update. It reuses the existing generated
+`pkg/server/assets.go`, so it never needs Node. Budget several minutes: measured
+here, even a single small `cmd` package took 5m52s wall against 31s CPU, so the
+time goes to linking and I/O, not compilation.
 
 ```bash
-export PATH=$HOME/.local/bin:$PATH
-export GOTMPDIR=$HOME/go/tmp TMPDIR=$HOME/go/tmp
-export GOMAXPROCS=2 GOFLAGS=-p=2
+source ~/.bbgo_profile
 
 cd ~/projects/bbgo
-git pull
+git checkout main && git pull          # §9 — the checkout lives on main-local
+git checkout main-local && git rebase main
 
 go build -tags web,release -o build/bbgo/bbgo ./cmd/bbgo
 install -m 755 build/bbgo/bbgo ~/.local/bin/bbgo
@@ -110,9 +144,7 @@ The dashboard is baked into the binary at build time, so a Go rebuild alone
 **will not** pick up UI changes. Regenerate the assets first:
 
 ```bash
-export PATH=$HOME/.local/bin:$PATH
-export GOTMPDIR=$HOME/go/tmp TMPDIR=$HOME/go/tmp
-export GOMAXPROCS=2 GOFLAGS=-p=2
+source ~/.bbgo_profile
 
 cd ~/projects/bbgo
 
@@ -343,6 +375,7 @@ will push the machine into swap and can starve the bot. Stop it first (§3B).
 | `401 ... API-key format invalid` | placeholder/wrong keys | Fix `.env.local`, verify with `bbgo account` |
 | Service not running after reboot | lingering off | `loginctl enable-linger vgerman` |
 | Config change had no effect | bbgo does not hot-reload | `systemctl --user restart bbgo` |
+| `git pull` says "no tracking information" | checkout is on `main-local` | `git checkout main && git pull`, then rebase (§9) |
 | `bind: address already in use` | stale bbgo or another process on 8080 | `ss -ltnp \| grep 8080`, `pkill -x bbgo` |
 
 Logs are the first stop for anything runtime-related:
@@ -359,7 +392,7 @@ journalctl --user --vacuum-size=200M
 ## 9. Updating from upstream
 
 This checkout sits on the local branch **`main-local`**, which is `main` plus the
-commit holding this runbook. `main` is the branch that tracks `origin/main`, so a
+commits holding this runbook. `main` is the branch that tracks `origin/main`, so a
 bare `git pull` while `main-local` is checked out fails with "no tracking
 information". Pull explicitly, then replay the runbook on top:
 
@@ -379,6 +412,21 @@ A rebase conflict can only occur in `README-local.md`; resolve it, then:
 ```bash
 git add README-local.md && git rebase --continue
 ```
+
+### The remote is SSH
+
+`origin` is `git@github.com:novaua/bbgo.git`. It was switched from the HTTPS URL
+the repo was originally cloned with, because there is no credential helper here:
+over HTTPS a push would demand a personal access token, while
+`~/.ssh/id_ed25519` already authenticates as `novaua`.
+
+```bash
+git remote -v                     # expect git@github.com:novaua/bbgo.git
+git push -u origin main-local     # publish this branch
+```
+
+Cloning over HTTPS still works for *reads* — the repository is public — so only
+pushing depends on the key.
 
 ### About this file
 
